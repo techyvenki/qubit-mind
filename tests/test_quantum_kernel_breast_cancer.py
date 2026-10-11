@@ -70,6 +70,56 @@ def test_quantum_gram(monkeypatch):
     assert np.allclose(K, np.eye(2))
 
 
+def test_build_fidelity_circuit_measures_all_qubits():
+    feature_map = q.build_feature_map("Z", n_qubits=3, reps=1)
+    circuit = q.build_fidelity_circuit(
+        feature_map, np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])
+    )
+
+    assert circuit.num_qubits == 3
+    assert circuit.num_clbits == 3
+    assert sum(instruction.operation.name == "measure" for instruction in circuit.data) == 3
+
+
+def test_backend_quantum_gram_batches_one_job():
+    class FakeResult:
+        def get_counts(self, index):
+            return [
+                {"000": 8, "001": 2},
+                {"000": 6, "001": 4},
+                {"000": 4, "001": 6},
+            ][index]
+
+    class FakeJob:
+        def result(self):
+            return FakeResult()
+
+    class FakeBackend:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, circuits, shots):
+            self.calls.append((circuits, shots))
+            return FakeJob()
+
+    backend = FakeBackend()
+    K_train, K_test = q.backend_quantum_gram(
+        backend,
+        "Z",
+        n_qubits=3,
+        reps=1,
+        X_train=np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]),
+        X_test=np.array([[0.7, 0.8, 0.9]]),
+        shots=10,
+    )
+
+    assert len(backend.calls) == 1
+    assert len(backend.calls[0][0]) == 3
+    assert backend.calls[0][1] == 10
+    assert np.allclose(K_train, [[1.0, 0.8], [0.8, 1.0]])
+    assert np.allclose(K_test, [[0.6, 0.4]])
+
+
 def test_decoherence_bandwidth_scale():
     x = np.array([[1.0, 2.0]])
     out = q.decoherence_bandwidth_scale(x, 0.5)
@@ -347,6 +397,7 @@ def test_pipeline_helpers(monkeypatch):
 
 def test_main_smoke(tmp_path, monkeypatch):
     monkeypatch.setattr(q, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(q, "RUN_MODE", "local")
 
     y = np.array([0, 1, 0, 1, 0, 1, 0, 1])
     X = np.arange(32.0).reshape(8, 4)

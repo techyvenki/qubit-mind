@@ -14,8 +14,6 @@ Single-file layered layout (each layer only depends on the ones above it):
     5. Evaluation    6. Visualization 7. Pipeline / entrypoint
 """
 
-from __future__ import annotations
-
 import json
 import time
 from dataclasses import dataclass
@@ -65,7 +63,13 @@ C_GRID = (0.1, 1.0, 10.0, 100.0)
 RBF_GAMMAS_ENCODED = tuple(np.logspace(-3, 1, 9))
 RBF_GAMMAS_FULL = tuple(np.logspace(-4, 0, 9))
 
-OUT_DIR = Path(__file__).resolve().parent / "outputs"
+# Set to "ionq" in Qollab to run the reduced, shot-based backend experiment.
+RUN_MODE = "local"
+IONQ_SAMPLE_COUNT = 12
+IONQ_SHOTS = 64
+
+PROJECT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+OUT_DIR = PROJECT_DIR / "outputs"
 
 
 @dataclass
@@ -144,6 +148,98 @@ def build_feature_map(name: str, n_qubits: int, reps: int) -> QuantumCircuit:
 # Interference: fidelity kernel computes overlap between encoded quantum states.
 def quantum_gram(fm: str, n_qubits: int, reps: int, X) -> np.ndarray:
     return FidelityStatevectorKernel(feature_map=build_feature_map(fm, n_qubits, reps)).evaluate(X)
+
+
+def build_fidelity_circuit(feature_map: QuantumCircuit, left: np.ndarray,
+                           right: np.ndarray) -> QuantumCircuit:
+    left_state = feature_map.assign_parameters(dict(zip(feature_map.parameters, left)))
+    right_state = feature_map.assign_parameters(dict(zip(feature_map.parameters, right)))
+    circuit = QuantumCircuit(feature_map.num_qubits, feature_map.num_qubits)
+    circuit.compose(left_state, inplace=True)
+    circuit.compose(right_state.inverse(), inplace=True)
+    circuit.measure(range(feature_map.num_qubits), range(feature_map.num_qubits))
+    return circuit
+
+
+def backend_quantum_gram(backend, fm: str, n_qubits: int, reps: int,
+                         X_train: np.ndarray, X_test: np.ndarray,
+                         shots: int = IONQ_SHOTS) -> tuple[np.ndarray, np.ndarray]:
+    """Compute train/train and test/train fidelity kernels in one backend job."""
+    if shots < 1:
+        raise ValueError("shots must be positive")
+
+    feature_map = build_feature_map(fm, n_qubits, reps)
+    circuits, pairs = [], []
+
+    def add_pair(left: np.ndarray, right: np.ndarray, split: str, row: int, col: int) -> None:
+        circuits.append(build_fidelity_circuit(feature_map, left, right))
+        pairs.append((split, row, col))
+
+    K_train = np.eye(len(X_train), dtype=float)
+    K_test = np.empty((len(X_test), len(X_train)), dtype=float)
+    for row in range(len(X_train)):
+        for col in range(row):
+            add_pair(X_train[row], X_train[col], "train", row, col)
+    for row in range(len(X_test)):
+        for col in range(len(X_train)):
+            add_pair(X_test[row], X_train[col], "test", row, col)
+
+    if not circuits:
+        return K_train, K_test
+    print(f"Submitting one backend job with {len(circuits)} circuits")
+    job = backend.run(circuits, shots=shots)
+    result = job.result()
+    for index, (split, row, col) in enumerate(pairs):
+        counts = result.get_counts(index)
+        zero_count = sum(count for bitstring, count in counts.items()
+                         if bitstring.replace(" ", "").count("1") == 0)
+        fidelity = zero_count / shots
+        if split == "train":
+            K_train[row, col] = K_train[col, row] = fidelity
+        else:
+            K_test[row, col] = fidelity
+    return K_train, K_test
+
+
+def run_ionq_demo() -> None:
+    qollab_backend = globals().get("backend")
+    if qollab_backend is None:
+        raise RuntimeError("IonQ mode requires Qollab's injected `backend`; select an IonQ simulator.")
+
+    X, y = load_breast_cancer_data()
+    X_small, _, y_small, _ = train_test_split(
+        X, y, train_size=IONQ_SAMPLE_COUNT, stratify=y, random_state=RANDOM_STATE
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_small, y_small, test_size=0.25, stratify=y_small, random_state=RANDOM_STATE
+    )
+    encoder = make_encoder(N_QUBITS)
+    encoded = encoder.fit(X_train).transform(np.vstack([X_train, X_test]))
+    Z_train = encoded[:len(X_train)]
+    Z_test = encoded[len(X_train):]
+
+    feature_map = build_feature_map("Z", N_QUBITS, 1)
+    circuit = build_fidelity_circuit(feature_map, Z_train[0], Z_train[1])
+    print(f"IonQ backend run: one 8-qubit fidelity circuit, {IONQ_SHOTS} shots")
+    print("Submitting one circuit because Qollab's IonQ endpoint accepts ionq.circuit.v1, not circuit batches.")
+    job = qollab_backend.run(circuit, shots=IONQ_SHOTS)
+    counts = job.result().get_counts()
+    zero_count = sum(count for bitstring, count in counts.items()
+                     if bitstring.replace(" ", "").count("1") == 0)
+    fidelity = zero_count / IONQ_SHOTS
+    print(f"Measured feature-map fidelity for one patient pair: {fidelity:.3f}")
+    print("This confirms IonQ simulator execution; classification metrics come from local mode.")
+    OUT_DIR.mkdir(exist_ok=True)
+    (OUT_DIR / "ionq_results.json").write_text(json.dumps({
+        "backend": str(qollab_backend),
+        "mode": "ionq_single_circuit_backend_check",
+        "samples_used_to_fit_encoder": IONQ_SAMPLE_COUNT,
+        "shots": IONQ_SHOTS,
+        "feature_map": "Z",
+        "reps": 1,
+        "measured_pair_fidelity": fidelity,
+        "counts": counts,
+    }, indent=2, default=float))
 
 
 # Decoherence-inspired control: bandwidth scales encoded angles to control effective phase spread.
@@ -433,6 +529,10 @@ def run_classical_baseline_same_encoded_features(split: SplitArtifacts, encoded_
 
 
 def main() -> None:
+    if RUN_MODE == "ionq":
+        run_ionq_demo()
+        return
+
     t_start = time.time()
     set_style()
     OUT_DIR.mkdir(exist_ok=True)
@@ -557,5 +657,5 @@ def main() -> None:
     print(f"\n  Total runtime {time.time() - t_start:.0f}s. Figures + results.json in {OUT_DIR}")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "backend" not in globals():
     main()
