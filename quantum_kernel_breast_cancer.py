@@ -1,22 +1,24 @@
 """
-Can a quantum circuit spot a tumor?
-Quantum kernel SVM (Qiskit QSVC) vs tuned classical RBF SVMs on Wisconsin Diagnostic Breast Cancer.
+Can a quantum circuit help spot a tumor?
+This script compares a quantum-kernel SVM (Qiskit QSVC) against tuned classical RBF SVM baselines
+on the Wisconsin Diagnostic Breast Cancer dataset.
 
 Dataset: 569 samples, 30 features; labels 0 = malignant, 1 = benign.
-Positive class for F1/recall is malignant (0): a missed cancer is the costly error.
+For F1/recall, the positive class is malignant (0), since missed cancers are the most costly errors.
 
 Requirements: qiskit>=2.1, qiskit-machine-learning>=0.9, scikit-learn, scipy, matplotlib, pylatexenc
 Run:          python quantum_kernel_breast_cancer.py   (figures + results.json are written to ./outputs)
 
-Single-file layered layout (each layer only uses the ones above it):
-  1. Config        2. Data          3. Encoding & quantum kernel   4. Models
-  5. Evaluation    6. Visualization 7. Pipeline / entrypoint
+Single-file layered layout (each layer only depends on the ones above it):
+    1. Config        2. Data          3. Encoding & quantum kernel   4. Models
+    5. Evaluation    6. Visualization 7. Pipeline / entrypoint
 """
 
 from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
@@ -66,13 +68,30 @@ RBF_GAMMAS_FULL = tuple(np.logspace(-4, 0, 9))
 OUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 
+@dataclass
+class SplitArtifacts:
+    X_train: np.ndarray
+    X_test: np.ndarray
+    y_train: np.ndarray
+    y_test: np.ndarray
+    X_all: np.ndarray
+    y_all: np.ndarray
+    train_idx: np.ndarray
+    test_idx: np.ndarray
+    cv_splits: list
+
+
 # ============================================================================= 2. DATA
-def load_and_split():
+def load_breast_cancer_data() -> tuple[np.ndarray, np.ndarray]:
     data = load_breast_cancer()
     X, y = data.data, data.target
     print("Wisconsin Diagnostic Breast Cancer (sklearn.load_breast_cancer)")
     print(f"  samples={X.shape[0]}, features={X.shape[1]}, "
           f"malignant={(y == MALIGNANT).sum()}, benign={(y == 1).sum()}")
+    return X, y
+
+
+def prepare_test_and_validation_data(X: np.ndarray, y: np.ndarray) -> SplitArtifacts:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
@@ -82,10 +101,21 @@ def load_and_split():
     te = np.arange(len(y_train), len(y_all))
     splits = list(StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE).split(X_train, y_train))
     print(f"  train/test = {len(tr)}/{len(te)} (stratified)\n")
-    return X_train, X_test, y_train, y_test, X_all, y_all, tr, te, splits
+    return SplitArtifacts(
+        X_train=X_train,
+        X_test=X_test,
+        y_train=y_train,
+        y_test=y_test,
+        X_all=X_all,
+        y_all=y_all,
+        train_idx=tr,
+        test_idx=te,
+        cv_splits=splits,
+    )
 
 
-# ============================================================================= 3. ENCODING & QUANTUM KERNEL
+# ============================================================================= 3. QUANTUM CONCEPT GROUPING
+# Superposition: continuous features are encoded into qubit rotation angles.
 def make_encoder(n_qubits: int) -> Pipeline:
     return Pipeline(
         [
@@ -96,6 +126,11 @@ def make_encoder(n_qubits: int) -> Pipeline:
     )
 
 
+def apply_superposition_encoding(X_train: np.ndarray, X_all: np.ndarray, n_qubits: int) -> np.ndarray:
+    return make_encoder(n_qubits).fit(X_train).transform(X_all)
+
+
+# Entanglement: ZZ and Y+ZZ maps add two-qubit interactions between neighboring qubits.
 def build_feature_map(name: str, n_qubits: int, reps: int) -> QuantumCircuit:
     if name == "Z":
         return z_feature_map(n_qubits, reps=reps)
@@ -106,8 +141,14 @@ def build_feature_map(name: str, n_qubits: int, reps: int) -> QuantumCircuit:
     raise ValueError(name)
 
 
+# Interference: fidelity kernel computes overlap between encoded quantum states.
 def quantum_gram(fm: str, n_qubits: int, reps: int, X) -> np.ndarray:
     return FidelityStatevectorKernel(feature_map=build_feature_map(fm, n_qubits, reps)).evaluate(X)
+
+
+# Decoherence-inspired control: bandwidth scales encoded angles to control effective phase spread.
+def decoherence_bandwidth_scale(encoded_features: np.ndarray, bandwidth: float) -> np.ndarray:
+    return encoded_features * bandwidth
 
 
 # ============================================================================= 4. MODELS
@@ -149,7 +190,7 @@ def select_quantum_kernel(Z_all, y_train, tr, splits):
         for reps in REPS_GRID:
             grid[(fm, reps)] = {}
             for bw in BANDWIDTHS:
-                K = quantum_gram(fm, N_QUBITS, reps, Z_all * bw)
+                K = quantum_gram(fm, N_QUBITS, reps, decoherence_bandwidth_scale(Z_all, bw))
                 _, _, per_c = tune_C(K[np.ix_(tr, tr)], y_train, splits)
                 for C, s in per_c.items():
                     grid[(fm, reps)][(bw, C)] = s
@@ -166,9 +207,11 @@ def fit_qsvc(cfg, Z_all, y_train, tr, te):
     kernel = FidelityStatevectorKernel(feature_map=build_feature_map(cfg["fm"], N_QUBITS, cfg["reps"]))
     qsvc = QSVC(quantum_kernel=kernel, C=cfg["C"], class_weight="balanced")
     t0 = time.time()
-    qsvc.fit(Z_all[tr] * cfg["bw"], y_train)
-    pred = qsvc.predict(Z_all[te] * cfg["bw"])
-    score = -qsvc.decision_function(Z_all[te] * cfg["bw"])
+    z_train = decoherence_bandwidth_scale(Z_all[tr], cfg["bw"])
+    z_test = decoherence_bandwidth_scale(Z_all[te], cfg["bw"])
+    qsvc.fit(z_train, y_train)
+    pred = qsvc.predict(z_test)
+    score = -qsvc.decision_function(z_test)
     return pred, score, time.time() - t0, len(qsvc.support_)
 
 
@@ -178,7 +221,7 @@ def compute_metrics(y_true, y_pred, malignant_score) -> dict:
         "accuracy": accuracy_score(y_true, y_pred),
         "f1_malignant": f1_score(y_true, y_pred, pos_label=MALIGNANT),
         "recall_malignant": recall_score(y_true, y_pred, pos_label=MALIGNANT),
-        "precision_malignant": precision_score(y_true, y_pred, pos_label=MALIGNANT),
+        "precision_malignant": precision_score(y_true, y_pred, pos_label=MALIGNANT, zero_division=0),
         "roc_auc": roc_auc_score((y_true == MALIGNANT).astype(int), malignant_score),
     }
 
@@ -194,13 +237,19 @@ def centered_alignment(K, y) -> float:
     H = np.eye(n) - np.ones((n, n)) / n
     Kc = H @ K @ H
     Y = np.outer(yy, yy)
-    return float(np.sum(Kc * Y) / (np.linalg.norm(Kc) * np.linalg.norm(Y)))
+    denom = np.linalg.norm(Kc) * np.linalg.norm(Y)
+    if denom == 0:
+        return 0.0
+    return float(np.sum(Kc * Y) / denom)
 
 
 def corrected_paired_ttest(diffs, n_train, n_test) -> tuple[float, float]:
+    diffs = np.asarray(diffs, dtype=float)
     k = len(diffs)
+    if k < 2 or n_train <= 0 or n_test < 0:
+        return 0.0, 1.0
     var = np.var(diffs, ddof=1)
-    if var == 0:
+    if var == 0 or not np.isfinite(var):
         return 0.0, 1.0
     t = diffs.mean() / np.sqrt((1 / k + n_test / n_train) * var)
     p = 2 * stats.t.sf(abs(t), df=k - 1)
@@ -289,7 +338,7 @@ def plot_model_selection(grid: dict, best: dict) -> None:
     fig.suptitle("QSVC model selection: 5-fold CV F1(malignant) on training set (best boxed)",
                  x=0.01, ha="left", fontsize=12, fontweight="bold")
     fig.tight_layout()
-    save(fig, "03_qsvc_model_selection.png")
+    save(fig, "02_qsvc_model_selection.png")
 
 
 def plot_leaderboard(test_results: dict, n_test: int) -> None:
@@ -311,7 +360,7 @@ def plot_leaderboard(test_results: dict, n_test: int) -> None:
     fig.suptitle(f"Held-out test set ({n_test} patients): every model, same split", x=0.01, ha="left",
                  fontsize=12, fontweight="bold")
     fig.tight_layout()
-    save(fig, "08_test_leaderboard.png")
+    save(fig, "04_test_leaderboard.png")
 
 
 def plot_roc_confusion(y_test, curves: dict, preds: dict) -> None:
@@ -340,7 +389,7 @@ def plot_roc_confusion(y_test, curves: dict, preds: dict) -> None:
         ax.set_title(f"{name}\nmissed cancers: {cm[0, 1]}", fontsize=10)
         ax.grid(False)
     fig.tight_layout()
-    save(fig, "09_roc_confusion.png")
+    save(fig, "05_roc_confusion.png")
 
 
 def plot_significance(diffs: dict) -> None:
@@ -360,71 +409,99 @@ def plot_significance(diffs: dict) -> None:
     ax.grid(axis="y", visible=False)
     ax.margins(x=0.25)
     fig.tight_layout()
-    save(fig, "11_paired_significance.png")
+    save(fig, "03_paired_significance.png")
 
 
 # ============================================================================= 7. PIPELINE
+def run_classical_baseline_all_features(split: SplitArtifacts):
+    X_all_std = StandardScaler().fit(split.X_train).transform(split.X_all)
+    best = tune_rbf(X_all_std, split.y_train, split.train_idx, split.cv_splits, RBF_GAMMAS_FULL)
+    return best, fit_eval_precomputed(best["K"], split.y_all, split.train_idx, split.test_idx, best["C"])
+
+
+def run_quantum_pipeline(split: SplitArtifacts):
+    encoded = apply_superposition_encoding(split.X_train, split.X_all, N_QUBITS)
+    grid, best_q = select_quantum_kernel(encoded, split.y_train, split.train_idx, split.cv_splits)
+    q_pred, q_score, q_time, n_sv = fit_qsvc(best_q, encoded, split.y_train, split.train_idx, split.test_idx)
+    return encoded, grid, best_q, (q_pred, q_score, q_time, n_sv)
+
+
+def run_classical_baseline_same_encoded_features(split: SplitArtifacts, encoded_features: np.ndarray):
+    best = tune_rbf(encoded_features, split.y_train, split.train_idx, split.cv_splits, RBF_GAMMAS_ENCODED)
+    pred, score = fit_eval_precomputed(best["K"], split.y_all, split.train_idx, split.test_idx, best["C"])
+    return best, (pred, score)
+
+
 def main() -> None:
     t_start = time.time()
     set_style()
     OUT_DIR.mkdir(exist_ok=True)
     algorithm_globals.random_seed = RANDOM_STATE
 
-    X_train, X_test, y_train, y_test, X_all, y_all, tr, te, splits = load_and_split()
+    # Step 1 and Step 2: load data and prepare train/test + validation folds.
+    print("[1/8] Load data")
+    X, y = load_breast_cancer_data()
+    print("\n[2/8] Prepare train/test split and validation folds")
+    split = prepare_test_and_validation_data(X, y)
+
     test_results, test_scores, test_preds = {}, {}, {}
 
     def record(name, pred, score):
-        test_results[name] = compute_metrics(y_test, pred, score)
+        test_results[name] = compute_metrics(split.y_test, pred, score)
         test_scores[name], test_preds[name] = score, pred
 
-    # --- classical reference: tuned RBF SVC on all 30 features
-    print("[1/4] Classical reference: tuned RBF SVC on all 30 features")
-    X_all_std = StandardScaler().fit(X_train).transform(X_all)
-    full_rbf = tune_rbf(X_all_std, y_train, tr, splits, RBF_GAMMAS_FULL)
-    name_full = "SVC RBF tuned (30 feat)"
-    record(name_full, *fit_eval_precomputed(full_rbf["K"], y_all, tr, te, full_rbf["C"]))
-    print(f"  {name_full:28s} CV F1(m)={full_rbf['cv_f1']:.3f} | test {format_metrics(test_results[name_full])}"
-          f"  (gamma={full_rbf['gamma']:.4g}, C={full_rbf['C']:g})")
+    # Step 3: quantum concept grouping in code.
+    print(f"\n[3/8] Quantum concept groups used in this pipeline")
+    print("  superposition: angle encoding with StandardScaler -> PCA -> MinMax(0, pi)")
+    print("  entanglement: ZZ / Y+ZZ feature maps with linear two-qubit interactions")
+    print("  interference: fidelity kernel overlap creates the quantum similarity matrix")
+    print("  decoherence-inspired control: bandwidth scaling on encoded angles")
 
-    # --- quantum model selection
-    print(f"\n[2/4] Quantum encoding (StandardScaler -> PCA({N_QUBITS}) -> angles) and QSVC model selection")
-    Z_all = make_encoder(N_QUBITS).fit(X_train).transform(X_all)
-    grid, best_q = select_quantum_kernel(Z_all, y_train, tr, splits)
-    plot_circuit(best_q["fm"], best_q["reps"], "Selected quantum feature map", "02_feature_map_circuit")
+    # Step 4 and Step 5: run logic on existing classical model + metrics.
+    print("\n[4/8] Apply logic on existing model: tuned classical RBF SVM (30 features)")
+    full_rbf, (full_pred, full_score) = run_classical_baseline_all_features(split)
+    name_full = "SVC RBF tuned (30 feat)"
+    record(name_full, full_pred, full_score)
+    print("[5/8] Metrics score and other for existing model")
+    print(f"  {name_full:28s} CV F1(m)={full_rbf['cv_f1']:.3f} | test {format_metrics(test_results[name_full])}"
+                f"  (gamma={full_rbf['gamma']:.4g}, C={full_rbf['C']:g})")
+
+    # Step 6 and Step 7: create quantum SVM and report metrics.
+    print(f"\n[6/8] Create Quantum SVM and apply quantum models")
+    Z_all, grid, best_q, (q_pred, q_score, q_time, n_sv) = run_quantum_pipeline(split)
+    plot_circuit(best_q["fm"], best_q["reps"], "Selected quantum feature map", "01_feature_map_circuit")
     plot_model_selection(grid, best_q)
 
-    # --- matched classical baseline + final test evaluation
-    print("\n[3/4] Fair head-to-head on identical encoded features + test evaluation")
-    matched = tune_rbf(Z_all, y_train, tr, splits, RBF_GAMMAS_ENCODED)
+    print("\n[7/8] Metrics score and other for quantum model + matched classical baseline")
+    matched, (matched_pred, matched_score) = run_classical_baseline_same_encoded_features(split, Z_all)
     print(f"  RBF same features: CV F1(m)={matched['cv_f1']:.3f} (gamma={matched['gamma']:.4g}, C={matched['C']:g})")
 
     name_q = f"QSVC {best_q['fm']} ({N_QUBITS} qubits)"
-    q_pred, q_score, q_time, n_sv = fit_qsvc(best_q, Z_all, y_train, tr, te)
     record(name_q, q_pred, q_score)
     print(f"  {name_q:28s} test {format_metrics(test_results[name_q])}  "
           f"(fit+predict {q_time:.1f}s, {n_sv} support vectors)")
 
     name_m = f"SVC RBF same {N_QUBITS} feat"
-    record(name_m, *fit_eval_precomputed(matched["K"], y_all, tr, te, matched["C"]))
+    record(name_m, matched_pred, matched_score)
     print(f"  {name_m:28s} test {format_metrics(test_results[name_m])}")
 
-    # --- paired significance
-    print(f"\n[4/4] Paired significance: {CV_REPEATS}x{CV_FOLDS} repeated CV on training set")
+    # Step 8: final comparison and significance.
+    print(f"\n[8/8] Comparison: paired significance ({CV_REPEATS}x{CV_FOLDS} repeated CV on training set)")
     rep_splits = list(RepeatedStratifiedKFold(n_splits=CV_FOLDS, n_repeats=CV_REPEATS,
-                                              random_state=RANDOM_STATE).split(X_train, y_train))
+                                              random_state=RANDOM_STATE).split(split.X_train, split.y_train))
     rep = {
-        "quantum": cv_f1(best_q["K"][np.ix_(tr, tr)], y_train, rep_splits, best_q["C"]),
-        "matched": cv_f1(matched["K"][np.ix_(tr, tr)], y_train, rep_splits, matched["C"]),
-        "full": cv_f1(full_rbf["K"][np.ix_(tr, tr)], y_train, rep_splits, full_rbf["C"]),
+        "quantum": cv_f1(best_q["K"][np.ix_(split.train_idx, split.train_idx)], split.y_train, rep_splits, best_q["C"]),
+        "matched": cv_f1(matched["K"][np.ix_(split.train_idx, split.train_idx)], split.y_train, rep_splits, matched["C"]),
+        "full": cv_f1(full_rbf["K"][np.ix_(split.train_idx, split.train_idx)], split.y_train, rep_splits, full_rbf["C"]),
     }
-    n_val = len(tr) // CV_FOLDS
+    n_val = len(split.train_idx) // CV_FOLDS
     comparisons = {
         "QSVC vs RBF (same features)": rep["quantum"] - rep["matched"],
         "QSVC vs RBF (30 features)": rep["quantum"] - rep["full"],
     }
     significance = {}
     for label, d in comparisons.items():
-        t, p = corrected_paired_ttest(d, len(tr) - n_val, n_val)
+        t, p = corrected_paired_ttest(d, len(split.train_idx) - n_val, n_val)
         significance[label] = {"diffs": d, "mean": float(d.mean()), "t": t, "p": p,
                                "wins": int((d > 0).sum()), "ties": int((d == 0).sum()),
                                "losses": int((d < 0).sum())}
@@ -434,23 +511,23 @@ def main() -> None:
     plot_significance(significance)
 
     alignment = {
-        "Quantum (QSVC)": centered_alignment(best_q["K"][np.ix_(tr, tr)], y_train),
-        "RBF, same features": centered_alignment(matched["K"][np.ix_(tr, tr)], y_train),
-        "RBF, 30 features": centered_alignment(full_rbf["K"][np.ix_(tr, tr)], y_train),
+        "Quantum (QSVC)": centered_alignment(best_q["K"][np.ix_(split.train_idx, split.train_idx)], split.y_train),
+        "RBF, same features": centered_alignment(matched["K"][np.ix_(split.train_idx, split.train_idx)], split.y_train),
+        "RBF, 30 features": centered_alignment(full_rbf["K"][np.ix_(split.train_idx, split.train_idx)], split.y_train),
     }
     for k, v in alignment.items():
         print(f"  {k:20s} centered alignment={v:.3f}")
 
     # --- reporting
-    plot_leaderboard(test_results, len(te))
-    plot_roc_confusion(y_test,
+    plot_leaderboard(test_results, len(split.test_idx))
+    plot_roc_confusion(split.y_test,
                        {k: test_scores[k] for k in (name_full, name_m, name_q)},
                        {k: test_preds[k] for k in (name_q, name_m)})
 
     verdict = {
         "qsvc_vs_matched_rbf_test_dF1": test_results[name_q]["f1_malignant"] - test_results[name_m]["f1_malignant"],
         "qsvc_vs_full_rbf_test_dF1": test_results[name_q]["f1_malignant"] - test_results[name_full]["f1_malignant"],
-        "missed_cancers": {k: int(confusion_matrix(y_test, test_preds[k], labels=[MALIGNANT, 1])[0, 1])
+        "missed_cancers": {k: int(confusion_matrix(split.y_test, test_preds[k], labels=[MALIGNANT, 1])[0, 1])
                            for k in (name_q, name_m, name_full)},
     }
     results = {
